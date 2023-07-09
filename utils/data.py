@@ -4,7 +4,7 @@ from rdkit import Chem
 from rdkit.Chem.rdchem import BondType
 from rdkit.Chem import ChemicalFeatures
 from rdkit import RDConfig
-
+import time
 ATOM_FAMILIES = ['Acceptor', 'Donor', 'Aromatic', 'Hydrophobe', 'LumpedHydrophobe', 'NegIonizable', 'PosIonizable',
                  'ZnBinder']
 ATOM_FAMILIES_ID = {s: i for i, s in enumerate(ATOM_FAMILIES)}
@@ -245,9 +245,11 @@ def parse_sdf_file(path):
     element = []
     accum_pos = 0
     accum_mass = 0
+    # print(f'rd_num_atoms: {rd_num_atoms}')
     for atom_idx in range(rd_num_atoms):
         atom = rdmol.GetAtomWithIdx(atom_idx)
         atom_num = atom.GetAtomicNum()
+        # print(f'atom: {atom}; atom_num: {atom_num}')
         element.append(atom_num)
         atom_weight = ptable.GetAtomicWeight(atom_num)
         accum_pos += pos[atom_idx] * atom_weight

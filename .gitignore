@@ -135,3 +135,12 @@ dmypy.json
 .DS_Store
 
 tmp
+
+logs_diffusion
+logs_guided
+outputs
+outputs1
+results_guided
+tmp.py
+data_processed_final.lmdb
+data_processed_final.lmdb-lock

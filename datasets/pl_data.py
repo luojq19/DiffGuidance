@@ -1,8 +1,13 @@
 import torch
+print(1)
 import torch_scatter
+print(2)
 import numpy as np
+print(3)
 from torch_geometric.data import Data
+print(4)
 from torch_geometric.loader import DataLoader
+print(5)
 
 FOLLOW_BATCH = ('protein_element', 'ligand_element', 'ligand_bond_type',)
 

@@ -3,16 +3,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_scatter import scatter_sum, scatter_mean
-import torch_cluster
 from tqdm.auto import tqdm
-import os, copy
 
 from models.common import compose_context, ShiftedSoftplus
 from models.egnn import EGNN
 from models.uni_transformer import UniTransformerO2TwoUpdateGeneral
-from utils.transforms import MAP_ATOM_TYPE_ONLY_TO_INDEX, MAP_INDEX_TO_ATOM_TYPE_AROMATIC
-import utils.misc as misc
-import utils.transforms as trans
+
 
 def get_refine_net(refine_net_type, config):
     if refine_net_type == 'uni_o2':
@@ -199,22 +195,15 @@ class SinusoidalPosEmb(nn.Module):
 
 
 # Model
-class ScorePosNet3D(nn.Module):
+class ScorePosNet3DSynth(nn.Module):
 
-    def __init__(self, config, protein_atom_feature_dim, ligand_atom_feature_dim, classifier_path=None, classifier_scale=1.0, device=None, guide_timestep=100, cls_type_only=False, cls_pos_only=False, cls_mode='molecule'):
+    def __init__(self, config, protein_atom_feature_dim, ligand_atom_feature_dim):
         super().__init__()
         self.config = config
 
-        self.cls_type_only = cls_type_only
-        self.cls_pos_only = cls_pos_only
-        self.cls_mode = cls_mode
         # variance schedule
         self.model_mean_type = config.model_mean_type  # ['noise', 'C0']
         self.loss_v_weight = config.loss_v_weight
-        self.device = device
-        self.classifier_scale = classifier_scale
-        self.guide_timestep = guide_timestep # only timestep <= self.guide_timestep will the classifier guide
-        # self.loss_guide_weight = config.loss_guide_weight
         # self.v_mode = config.v_mode
         # assert self.v_mode == 'categorical'
         # self.v_net_type = getattr(config, 'v_net_type', 'mlp')
@@ -320,16 +309,17 @@ class ScorePosNet3D(nn.Module):
             ShiftedSoftplus(),
             nn.Linear(self.hidden_dim, ligand_atom_feature_dim),
         )
-        if classifier_path is not None:
-            self.classifier = get_classifier(classifier_path, device, mode=self.cls_mode)
+        self.synth_inference = nn.Sequential(
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.ReLU(),
+            nn.Linear(self.hidden_dim, 2),
+        )
 
     def forward(self, protein_pos, protein_v, batch_protein, init_ligand_pos, init_ligand_v, batch_ligand,
                 time_step=None, return_all=False, fix_x=False):
 
         batch_size = batch_protein.max().item() + 1
         init_ligand_v = F.one_hot(init_ligand_v, self.num_classes).float()
-        # print('init_ligand_v:', init_ligand_v.shape)
-        # input()
         # time embedding
         if self.time_emb_dim > 0:
             if self.time_emb_mode == 'simple':
@@ -364,55 +354,31 @@ class ScorePosNet3D(nn.Module):
         outputs = self.refine_net(h_all, pos_all, mask_ligand, batch_all, return_all=return_all, fix_x=fix_x)
         final_pos, final_h = outputs['x'], outputs['h']
         final_ligand_pos, final_ligand_h = final_pos[mask_ligand], final_h[mask_ligand]
-        final_ligand_v = self.v_inference(final_ligand_h)
+        
+        if batch_ligand is None: 
+            out = final_ligand_h.mean(dim=0, keepdims=True)
+        else: 
+            out = scatter_mean(final_ligand_h, batch_ligand, dim=0)
+        # final_ligand_v = self.v_inference(final_ligand_h)
+        synth_logits = self.synth_inference(out)
+        
+        return synth_logits
+        # preds = {
+        #     'pred_ligand_pos': final_ligand_pos,
+        #     'pred_ligand_v': final_ligand_v,
+        #     'final_h': final_h,
+        #     'final_ligand_h': final_ligand_h
+        # }
+        # if return_all:
+        #     final_all_pos, final_all_h = outputs['all_x'], outputs['all_h']
+        #     final_all_ligand_pos = [pos[mask_ligand] for pos in final_all_pos]
+        #     final_all_ligand_v = [self.v_inference(h[mask_ligand]) for h in final_all_h]
+        #     preds.update({
+        #         'layer_pred_ligand_pos': final_all_ligand_pos,
+        #         'layer_pred_ligand_v': final_all_ligand_v
+        #     })
+        # return preds
 
-        preds = {
-            'pred_ligand_pos': final_ligand_pos,
-            'pred_ligand_v': final_ligand_v,
-            'final_h': final_h,
-            'final_ligand_h': final_ligand_h
-        }
-        if return_all:
-            final_all_pos, final_all_h = outputs['all_x'], outputs['all_h']
-            final_all_ligand_pos = [pos[mask_ligand] for pos in final_all_pos]
-            final_all_ligand_v = [self.v_inference(h[mask_ligand]) for h in final_all_h]
-            preds.update({
-                'layer_pred_ligand_pos': final_all_ligand_pos,
-                'layer_pred_ligand_v': final_all_ligand_v
-            })
-        return preds
-
-    # TODO: classifier guided gradient
-    def guide_grad(self, ligand_pos, ligand_v, timestep=torch.tensor([0]), batch=None, classifier_scale=0.1):
-        # TODO: here we set a fixed threshold r=1.6 to infer edges from coordinates, but the actually edges here are chemical bonds, so later we need to use more sophisticated way to infer edges, like molecule reconstruction
-        edge_index = torch_cluster.radius_graph(ligand_pos, r=1.6, batch=batch)
-        aft = ligand_v
-        if self.cls_type_only:
-            aft = type_aromatic_idx2type_only_idx(aft)
-        if self.cls_pos_only:
-            aft = torch.zeros_like(aft, dtype=aft.dtype)
-        atom_feature_full = torch.nn.functional.one_hot(aft, self.classifier.atom_feature_dim)
-        with torch.enable_grad():
-            pos_in = ligand_pos.detach().requires_grad_(True)
-            logits = self.classifier(pos_in, atom_feature_full, edge_index, t=timestep, batch=batch)
-            log_probs = F.log_softmax(logits, dim=-1)
-            selected = log_probs[range(len(logits)), 1]
-            return torch.autograd.grad(selected.sum(), pos_in)[0] * classifier_scale
-    
-    def guide_grad_with_protein(self, protein_pos, protein_v, batch_protein, ligand_pos, ligand_v, batch_ligand, timestep=torch.tensor([0]), classifier_scale=0.001):
-        with torch.enable_grad():
-            pos_in = ligand_pos.detach().requires_grad_(True)
-            logits = self.classifier(protein_pos=protein_pos, 
-                           protein_v=protein_v,
-                           batch_protein=batch_protein,
-                           init_ligand_pos=pos_in,
-                           init_ligand_v=ligand_v,
-                           batch_ligand=batch_ligand,
-                           )
-            log_probs = F.log_softmax(logits, dim=-1)
-            selected = log_probs[range(len(logits)), 1]
-            return torch.autograd.grad(selected.sum(), pos_in)[0] * classifier_scale
-    
     # atom type diffusion process
     def q_v_pred_one_timestep(self, log_vt_1, t, batch):
         # q(vt | vt-1)
@@ -529,8 +495,7 @@ class ScorePosNet3D(nn.Module):
         return loss_v
 
     def get_diffusion_loss(
-            self, protein_pos, protein_v, batch_protein, ligand_pos, ligand_v, batch_ligand, time_step=None, 
-            batch_smiles=None
+            self, protein_pos, protein_v, batch_protein, ligand_pos, ligand_v, batch_ligand, time_step=None
     ):
         num_graphs = batch_protein.max().item() + 1
         protein_pos, ligand_pos, _ = center_pos(
@@ -596,23 +561,11 @@ class ScorePosNet3D(nn.Module):
         kl_v = self.compute_v_Lt(log_v_model_prob=log_v_model_prob, log_v0=log_ligand_v0,
                                  log_v_true_prob=log_v_true_prob, t=time_step, batch=batch_ligand)
         loss_v = torch.mean(kl_v)
-        
-        # classifier guidance
-        loss_guide = 0
-        # with torch.no_grad():
-        #     synth_score = self.classifier(batch_smiles, batch_smiles)[:, 1]
-        # synth_guide = torch.ones_like(synth_score).to(synth_score.device)
-        # loss_guide = F.mse_loss(synth_score, synth_guide)
-        # print('loss_guide:', loss_guide)
-        # print(loss_pos, loss_v)
-        
         loss = loss_pos + loss_v * self.loss_v_weight
-        # loss = loss_pos + loss_v * self.loss_v_weight + loss_guide * self.loss_guide_weight
 
         return {
             'loss_pos': loss_pos,
             'loss_v': loss_v,
-            'loss_guide': loss_guide,
             'loss': loss,
             'x0': ligand_pos,
             'pred_ligand_pos': pred_ligand_pos,
@@ -694,9 +647,6 @@ class ScorePosNet3D(nn.Module):
                          init_ligand_pos, init_ligand_v, batch_ligand,
                          num_steps=None, center_pos_mode=None, pos_only=False):
 
-        # print('batch_ligand:', batch_ligand)
-        # print(batch_ligand.shape)
-        # input()
         if num_steps is None:
             num_steps = self.num_timesteps
         num_graphs = batch_protein.max().item() + 1
@@ -707,24 +657,10 @@ class ScorePosNet3D(nn.Module):
         pos_traj, v_traj = [], []
         v0_pred_traj, vt_pred_traj = [], []
         ligand_pos, ligand_v = init_ligand_pos, init_ligand_v
-        
-        # print(ligand_v)
-        # print(ligand_v.shape)
-        # input()
         # time sequence
         time_seq = list(reversed(range(self.num_timesteps - num_steps, self.num_timesteps)))
-        # print(f'time_seq: {time_seq}, {len(time_seq)}')
-        # for i in tqdm(time_seq, desc='sampling', total=len(time_seq), dynamic_ncols=True):
-        #     print(f'i: {i}')
-        #     input()
-        # input()
-        for i in tqdm(time_seq, desc='sampling', total=len(time_seq), dynamic_ncols=True):
-            # print(ligand_v.shape)
-            # input()
+        for i in tqdm(time_seq, desc='sampling', total=len(time_seq)):
             t = torch.full(size=(num_graphs,), fill_value=i, dtype=torch.long, device=protein_pos.device)
-            # print(f'batch_ligand: {batch_ligand}')
-            # print(f't: {t}, {t.shape}')
-            # input()
             preds = self(
                 protein_pos=protein_pos,
                 protein_v=protein_v,
@@ -747,32 +683,6 @@ class ScorePosNet3D(nn.Module):
                 raise ValueError
 
             pos_model_mean = self.q_pos_posterior(x0=pos0_from_e, xt=ligand_pos, t=t, batch=batch_ligand)
-            
-            # add guide gradient
-            # print(f'i: {i}')
-            if i <= self.guide_timestep:
-                if self.cls_mode == 'molecule':
-                    guide_gradient_pos = self.guide_grad(ligand_pos=ligand_pos, 
-                                                 ligand_v=ligand_v, 
-                                                 batch=batch_ligand, 
-                                                 timestep=t,
-                                                 classifier_scale=self.classifier_scale)
-                elif self.cls_mode == 'protein':
-                    guide_gradient_pos = self.guide_grad_with_protein(
-                        protein_pos=protein_pos,
-                        protein_v=protein_v,
-                        batch_protein=batch_protein,
-                        ligand_pos=ligand_pos,
-                        ligand_v=ligand_v,
-                        batch_ligand=batch_ligand,
-                        timestep=t,
-                        classifier_scale=self.classifier_scale
-                    )
-                else:
-                    raise NotImplementedError
-                
-                pos_model_mean += guide_gradient_pos
-            
             pos_log_variance = extract(self.posterior_logvar, t, batch_ligand)
             # no noise when t == 0
             nonzero_mask = (1 - (t == 0).float())[batch_ligand].unsqueeze(-1)
@@ -795,10 +705,6 @@ class ScorePosNet3D(nn.Module):
             v_traj.append(ligand_v.clone().cpu())
 
         ligand_pos = ligand_pos + offset[batch_ligand]
-        
-        # print(ligand_v)
-        # print(ligand_v.shape)
-        # input()
         return {
             'pos': ligand_pos,
             'v': ligand_v,
@@ -808,128 +714,7 @@ class ScorePosNet3D(nn.Module):
             'vt_traj': vt_pred_traj
         }
 
-    def sample_time_limit(self, num_graphs, device, method, lower, high):
-        if method == 'importance':
-            if not (self.Lt_count > 10).all():
-                return self.sample_time(num_graphs, device, method='symmetric')
-
-            Lt_sqrt = torch.sqrt(self.Lt_history + 1e-10) + 0.0001
-            Lt_sqrt[0] = Lt_sqrt[1]  # Overwrite decoder term with L1.
-            pt_all = Lt_sqrt / Lt_sqrt.sum()
-
-            time_step = torch.multinomial(pt_all, num_samples=num_graphs, replacement=True)
-            pt = pt_all.gather(dim=0, index=time_step)
-            return time_step, pt
-
-        elif method == 'symmetric':
-            time_step = torch.randint(
-                max(0, lower), min(self.num_timesteps, high), size=(num_graphs // 2 + 1,), device=device)
-            time_step = torch.cat(
-                [time_step, self.num_timesteps - time_step - 1], dim=0)[:num_graphs]
-            pt = torch.ones_like(time_step).float() / self.num_timesteps
-            return time_step, pt
-
-        else:
-            raise ValueError
-    
-    def generate_single_noised_data(self, data: dict):
-        noised_data = copy.deepcopy(data)
-        num_graphs = 1
-        # 1. sample noise levels
-        time_step, pt = self.sample_time_limit(num_graphs, 'cuda:0', self.sample_time_method, lower=0, high=self.guide_timestep + 1)
-        # while time_step.item() > self.guide_timestep:
-        #     time_step, pt = self.sample_time(num_graphs, 'cuda:0', self.sample_time_method)
-        # print(time_step, data['timestep'])
-        # input()
-        a = self.alphas_cumprod.index_select(0, time_step)  # (num_graphs, )
-
-        # 2. perturb pos and v
-        batch_ligand = torch.zeros_like(data['atom_feature_full']).to(a.device)
-        a_pos = a[batch_ligand].unsqueeze(-1)  # (num_ligand_atoms, 1)
-        ligand_pos = data['pos'].to(a.device)
-        ligand_v = data['atom_feature_full'].to(a.device)
-        # print(f'pos, v: {ligand_pos.shape}, {ligand_v.shape}, {ligand_v}')
-        pos_noise = torch.zeros_like(ligand_pos)
-        pos_noise.normal_()
-        # Xt = a.sqrt() * X0 + (1-a).sqrt() * eps
-        ligand_pos_perturbed = a_pos.sqrt() * ligand_pos + (1.0 - a_pos).sqrt() * pos_noise  # pos_noise * std
-        # Vt = a * V0 + (1-a) / K
-        log_ligand_v0 = index_to_log_onehot(ligand_v, self.num_classes)
-        ligand_v_perturbed, log_ligand_vt = self.q_v_sample(log_ligand_v0, time_step, batch_ligand)
-        # print(f'perturbed pos, v: {ligand_pos_perturbed.shape}, {ligand_v_perturbed.shape}, {ligand_v_perturbed}')
-        # input()
-        noised_data['pos'] = ligand_pos_perturbed.cpu()
-        noised_data['atom_feature_full'] = ligand_v_perturbed.cpu()
-        noised_data['timestep'] = time_step.cpu()
-        
-        return noised_data
-
-    def generate_noised_data(self, src_file = '../DiffMol/molecule_synth_data/synth3ddataset-balanced.pt', 
-                             num_noised_per_mol=5,
-                             save_path='../DiffMol/molecule_synth_data/synth3ddataset-balanced-noised.pt'):
-        src_data = torch.load(src_file)
-        print(f'Loaded src data from {src_file}: {len(src_data)} molecules')
-        
-        noised_data = []
-        for data in tqdm(src_data, dynamic_ncols=True, desc='noised data'):
-            data['timestep'] = torch.tensor([0])
-            # noised_data.append(data)
-            for i in range(num_noised_per_mol):
-                noised = self.generate_single_noised_data(data)
-                noised_data.append(noised)
-        print(f'noised_data: {len(noised_data)}')
-        torch.save(noised_data, save_path)
-        print(f'Saving noised data to {save_path}')
 
 def extract(coef, t, batch):
     out = coef[t][batch]
     return out.unsqueeze(-1)
-
-def get_classifier(classifier_path, device, mode='molecule'):
-    if mode == 'molecule':
-        os.system(f'cp {os.path.join(classifier_path, "models/synth_model.py")} /work/jiaqi/targetdiff/models/classifier.py')
-        from models.classifier import SynthEGNN
-        import yaml
-        with open(os.path.join(classifier_path, 'config.yml')) as f:
-            configs = yaml.load(f, Loader=yaml.FullLoader)
-        aft_dim = 13
-        if 'atom_type_only' in configs and configs['atom_type_only']:
-            aft_dim = 8
-        if 'pos_only' in configs and configs['pos_only']:
-            aft_dim = 1
-        classifier = SynthEGNN(num_layers=configs['num_layers'], dropout=configs['dropout'], no_edge_index=configs['no_edge_index'], atom_feature_dim=aft_dim)
-        state_dict = torch.load(os.path.join(classifier_path, 'best_checkpoint.pt'))
-        classifier.load_state_dict(state_dict)
-        classifier.to(device)
-        classifier.eval()
-        print(f'Successfully loaded classifier from {classifier_path}')
-    elif mode == 'protein':
-        os.system(f"cp {os.path.join(classifier_path, 'models/cls_molopt_score_model.py')} /work/jiaqi/targetdiff/models/classifier.py")
-        from models.classifier import ScorePosNet3DSynth
-        config = misc.load_config(os.path.join(classifier_path, 'train_cls.yml'))
-        protein_featurizer = trans.FeaturizeProteinAtom()
-        ligand_featurizer = trans.FeaturizeLigandAtom(config.data.transform.ligand_atom_mode)
-        classifier = ScorePosNet3DSynth(
-                    config.model,
-                    protein_atom_feature_dim=protein_featurizer.feature_dim,
-                    ligand_atom_feature_dim=ligand_featurizer.feature_dim
-                ).to(device)
-        ckpt = torch.load(os.path.join(classifier_path, 'checkpoints/best_checkpoint.pt'))
-        classifier.load_state_dict(ckpt)
-        classifier.eval()
-        print(f'Successfully loaded classifier from {classifier_path}')
-    else:
-        raise NotImplementedError
-                
-    return classifier
-
-def get_bond_index_from_pos_v(ligand_pos, ligand_v):
-    pass
-
-def type_aromatic_idx2type_only_idx(idx):
-    if type(idx) is int:
-        return MAP_ATOM_TYPE_ONLY_TO_INDEX[MAP_INDEX_TO_ATOM_TYPE_AROMATIC[idx][0]]
-    else:
-        for i in range(len(idx)):
-            idx[i] = MAP_ATOM_TYPE_ONLY_TO_INDEX[MAP_INDEX_TO_ATOM_TYPE_AROMATIC[int(idx[i])][0]]
-        return idx

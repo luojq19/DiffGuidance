@@ -14,10 +14,10 @@ import utils.misc as misc
 import utils.transforms as trans
 from datasets import get_dataset
 from datasets.pl_data import FOLLOW_BATCH
-from models.molopt_score_model import ScorePosNet3D, log_sample_categorical
+from models.molopt_score_model_2 import ScorePosNet3D, log_sample_categorical
 from utils.evaluation import atom_num
 
-
+torch.set_num_threads(1)
 def unbatch_v_traj(ligand_v_traj, n_data, ligand_cum_atoms):
     all_step_v = [[] for _ in range(n_data)]
     for v in ligand_v_traj:  # step_i
@@ -68,7 +68,10 @@ def sample_diffusion_ligand(model, data, num_samples, batch_size=16, device='cud
             else:
                 uniform_logits = torch.zeros(len(batch_ligand), model.num_classes).to(device)
                 init_ligand_v = log_sample_categorical(uniform_logits)
-
+            # print(init_ligand_v.shape)
+            # print(batch.ligand_atom_feature_full.shape)
+            # input()
+            
             r = model.sample_diffusion(
                 protein_pos=batch.protein_pos,
                 protein_v=batch.protein_atom_feature.float(),
@@ -122,7 +125,11 @@ if __name__ == '__main__':
     parser.add_argument('-i', '--data_id', type=int)
     parser.add_argument('--device', type=str, default='cuda:0')
     parser.add_argument('--batch_size', type=int, default=100)
-    parser.add_argument('--result_path', type=str, default='./outputs')
+    parser.add_argument('--result_path', type=str, default='./outputs_tmp')
+    parser.add_argument('--classifier_scale', type=float, default=1e-9)
+    parser.add_argument('--classifier_path', type=str, default='/work/jiaqi/DiffMol/3d_synth_noised_log/exp_noise100-20230331-1138')
+    parser.add_argument('--generate_noised_data', action='store_true')
+    parser.add_argument('--guide_timestep', type=int, default=100)
     args = parser.parse_args()
 
     logger = misc.get_logger('sampling')
@@ -131,11 +138,12 @@ if __name__ == '__main__':
     config = misc.load_config(args.config)
     logger.info(config)
     misc.seed_all(config.sample.seed)
-
+    classifier_scale = args.classifier_scale
     # Load checkpoint
     ckpt = torch.load(config.model.checkpoint, map_location=args.device)
     logger.info(f"Training Config: {ckpt['config']}")
-
+    logger.info(f'Classifier scale: {classifier_scale}')
+    
     # Transforms
     protein_featurizer = trans.FeaturizeProteinAtom()
     ligand_atom_mode = ckpt['config'].data.transform.ligand_atom_mode
@@ -146,6 +154,8 @@ if __name__ == '__main__':
         trans.FeaturizeLigandBond(),
     ])
 
+    # print("ligand_featurizer.feature_dim:", ligand_featurizer.feature_dim)
+    # input()
     # Load dataset
     dataset, subsets = get_dataset(
         config=ckpt['config'].data,
@@ -153,15 +163,32 @@ if __name__ == '__main__':
     )
     train_set, test_set = subsets['train'], subsets['test']
     logger.info(f'Successfully load the dataset (size: {len(test_set)})!')
+    # for data in test_set:
+    #     print(data)
+    #     input()
+    #     print((data.ligand_atom_feature_full.max()))
+    # input()
 
     # Load model
     model = ScorePosNet3D(
         ckpt['config'].model,
         protein_atom_feature_dim=protein_featurizer.feature_dim,
-        ligand_atom_feature_dim=ligand_featurizer.feature_dim
+        ligand_atom_feature_dim=ligand_featurizer.feature_dim,
+        classifier_path=args.classifier_path,
+        classifier_scale=classifier_scale,
+        device=args.device,
+        guide_timestep=args.guide_timestep
     ).to(args.device)
-    model.load_state_dict(ckpt['model'])
+    state_dict = model.state_dict()
+    state_dict.update(ckpt['model'])
+    model.load_state_dict(state_dict)
     logger.info(f'Successfully load the model! {config.model.checkpoint}')
+    
+    if args.generate_noised_data:
+        print(f'Generating noised dataset...')
+        model.generate_noised_data(src_file='/work/jiaqi/DiffMol/molecule_synth_data/TDsamples_balanced_by_crsd.pt',
+            save_path=f'/work/jiaqi/DiffMol/molecule_synth_data/TDsamples_balanced_by_crsd-noised-{args.guide_timestep}.pt')
+        exit()
 
     data = test_set[args.data_id]
     pred_pos, pred_v, pred_pos_traj, pred_v_traj, pred_v0_traj, pred_vt_traj, time_list = sample_diffusion_ligand(
@@ -172,6 +199,9 @@ if __name__ == '__main__':
         center_pos_mode=config.sample.center_pos_mode,
         sample_num_atoms=config.sample.sample_num_atoms
     )
+    # print(len(pred_pos), len(pred_v), len(pred_pos_traj), len(pred_v_traj))
+    # print(pred_pos[0].shape, pred_v[0].shape, pred_pos_traj[0].shape, pred_v_traj[0].shape)
+    # input()
     result = {
         'data': data,
         'pred_ligand_pos': pred_pos,
